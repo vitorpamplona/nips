@@ -57,7 +57,6 @@ They exist to document what may be implemented by [Nostr](https://github.com/nos
 - [NIP-39: External Identities in Profiles](39.md)
 - [NIP-40: Expiration Timestamp](40.md)
 - [NIP-42: Authentication of clients to relays](42.md)
-- [NIP-43: Key Control Declaration](43.md)
 - [NIP-44: Versioned Encryption](44.md)
 - [NIP-45: Counting results](45.md)
 - [NIP-46: Nostr Connect](46.md)
@@ -92,6 +91,7 @@ They exist to document what may be implemented by [Nostr](https://github.com/nos
 - [NIP-96: HTTP File Storage Integration](96.md)
 - [NIP-98: HTTP Auth](98.md)
 - [NIP-99: Classified Listings](99.md)
+- [NIP-A1: Key Set Declaration](A1.md)
 
 ## Event Kinds
 
@@ -165,7 +165,7 @@ They exist to document what may be implemented by [Nostr](https://github.com/nos
 | `10015`       | Interests list                  | [51](51.md)                            |
 | `10019`       | Nutzap Mint Recommendation      | [61](61.md)                            |
 | `10030`       | User emoji list                 | [51](51.md)                            |
-| `10045`       | Key Control Declaration         | [43](43.md)                            |
+| `10045`       | Key Set Declaration             | [A1](A1.md)                            |
 | `10050`       | Relay list to receive DMs       | [51](51.md), [17](17.md)               |
 | `10063`       | User server list                | [Blossom][blossom]                     |
 | `10096`       | File storage server list        | [96](96.md)                            |
