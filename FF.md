@@ -39,16 +39,16 @@ None of these columns is ever NULL.
 |--------------|---------|-----------------------------------------------------------|
 | `event_id`   | TEXT    | the `id` of the event holding the tag                     |
 | `idx`        | INTEGER | the tag's 0-based position in that event's `tags` array   |
-| `name`       | TEXT    | `tag[0]`                                                  |
-| `value`      | TEXT    | `tag[1]`, or NULL when the tag has fewer than 2 elements  |
-| `v2`         | TEXT    | `tag[2]`, or NULL when absent                             |
-| `v3`         | TEXT    | `tag[3]`, or NULL when absent                             |
-| `v4`         | TEXT    | `tag[4]`, or NULL when absent                             |
+| `t0`         | TEXT    | `tag[0]`, the tag's name                                  |
+| `t1`         | TEXT    | `tag[1]`, or NULL when absent                             |
+| `t2`         | TEXT    | `tag[2]`, or NULL when absent                             |
+| `t3`         | TEXT    | `tag[3]`, or NULL when absent                             |
+| `t4`         | TEXT    | `tag[4]`, or NULL when absent                             |
 | `created_at` | INTEGER | the holding event's `created_at`                          |
 | `kind`       | INTEGER | the holding event's `kind`                                |
 | `pubkey`     | TEXT    | the holding event's `pubkey`                              |
 
-A tag that is an empty array has no row. Elements past `tag[4]` are not visible. `created_at`, `kind` and `pubkey` repeat the holding event's fields so that most tag questions need no join.
+A tag that is an empty array has no row. Elements past `tag[4]` are not visible. A NIP-01 filter's `#x` condition is `t0 = 'x' AND t1 IN (…)`. `created_at`, `kind` and `pubkey` repeat the holding event's fields so that most tag questions need no join.
 
 ## Types and values
 
@@ -433,12 +433,12 @@ A relay that does not run a query, or stops running one, answers with `CLOSED`:
 
 A relay MAY decline any valid query it judges too expensive with `unsupported:`, for example:
 
-- a query that reads a source without a condition on `id`/`event_id`, `pubkey`, `kind` or a tag `name`/`value`;
+- a query that reads a source without a condition on `id`/`event_id`, `pubkey`, `kind` or a tag's `t0`/`t1`;
 - a query that exceeds the relay's time or memory budget.
 
 Relays SHOULD state the condition that would make the query acceptable. A declined query is not a wrong answer. A relay that answers MUST answer exactly as this NIP specifies.
 
-Clients get the best service from queries that constrain every `events`/`tags` source by `kind`, `pubkey`, `id` or a tag `name`/`value`, and that use `ORDER BY created_at DESC` with a `LIMIT` for listings.
+Clients get the best service from queries that constrain every `events`/`tags` source by `kind`, `pubkey`, `id` or a tag's `t0`/`t1`, and that use `ORDER BY created_at DESC` with a `LIMIT` for listings.
 
 ## Conformance
 
@@ -470,19 +470,19 @@ Relays that implement this NIP include its number in `supported_nips` ([NIP-11](
 Zap totals per zapped note, in sats:
 
 ```sql
-SELECT target.value AS note, count(*) AS zaps, sum(CAST(amount.value AS INTEGER)) / 1000 AS sats
-FROM tags AS target JOIN tags AS amount ON amount.event_id = target.event_id AND amount.name = 'amount'
-WHERE target.kind = 9735 AND target.name = 'e'
-GROUP BY target.value ORDER BY sats DESC LIMIT 20
+SELECT target.t1 AS note, count(*) AS zaps, sum(CAST(amount.t1 AS INTEGER)) / 1000 AS sats
+FROM tags AS target JOIN tags AS amount ON amount.event_id = target.event_id AND amount.t0 = 'amount'
+WHERE target.kind = 9735 AND target.t0 = 'e'
+GROUP BY target.t1 ORDER BY sats DESC LIMIT 20
 ```
 
 Write relays named in [NIP-65](65.md) lists, by how many authors use them:
 
 ```sql
-SELECT value AS relay, count(DISTINCT pubkey) AS authors
+SELECT t1 AS relay, count(DISTINCT pubkey) AS authors
 FROM tags
-WHERE kind = 10002 AND name = 'r' AND (v2 IS NULL OR v2 = 'write')
-GROUP BY value ORDER BY authors DESC LIMIT 100
+WHERE kind = 10002 AND t0 = 'r' AND (t2 IS NULL OR t2 = 'write')
+GROUP BY t1 ORDER BY authors DESC LIMIT 100
 ```
 
 Reactions per note of one author, including notes with none:
@@ -490,7 +490,7 @@ Reactions per note of one author, including notes with none:
 ```sql
 SELECT notes.id, count(reactions.event_id) AS total
 FROM events AS notes LEFT JOIN tags AS reactions
-  ON reactions.value = notes.id AND reactions.kind = 7 AND reactions.name = 'e'
+  ON reactions.t1 = notes.id AND reactions.kind = 7 AND reactions.t0 = 'e'
 WHERE notes.kind = 1 AND notes.pubkey = ?
 GROUP BY notes.id ORDER BY total DESC
 ```
@@ -504,8 +504,8 @@ SELECT pubkey, max(created_at) FROM events WHERE kind = 0 AND pubkey IN (?, ?, ?
 The geometric mean of zap amounts in a time window:
 
 ```sql
-SELECT exp(avg(ln(CAST(value AS REAL)))) FROM tags
-WHERE kind = 9735 AND name = 'amount' AND created_at BETWEEN :since AND :until
+SELECT exp(avg(ln(CAST(t1 AS REAL)))) FROM tags
+WHERE kind = 9735 AND t0 = 'amount' AND created_at BETWEEN :since AND :until
 ```
 
 ## Implementation notes
@@ -524,7 +524,7 @@ This section is non-normative.
 | Infinity in results | SQLite prints REAL infinity as `Inf` | Map it to the spelling defined under [Protocol](#protocol) |
 
 **Stores that are not SQLite.** Such a store can still answer the language:
-1. Push each source's constant conditions (`kind`, `pubkey`, `id`, tag `name`/`value`, time bounds) down as a NIP-01 filter.
+1. Push each source's constant conditions (`kind`, `pubkey`, `id`, tag `t0`/`t1`, time bounds) down as a NIP-01 filter.
 2. Load the matching events into an in-memory SQLite shaped like `events` and `tags`.
 3. Run the query there.
 
