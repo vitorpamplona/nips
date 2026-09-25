@@ -1,4 +1,4 @@
-NIP-XX
+NIP-FF
 ======
 
 Nostr Query Language (NQL)
@@ -64,6 +64,8 @@ Every value has one of four types:
 Every expression has a single static type, determined before execution by the rules below. A query that breaks a typing rule is invalid and MUST be refused before any row is produced.
 
 The only implicit conversion is **numeric promotion**: where an operator or function accepts two numeric operands of different types, the INTEGER operand is converted to REAL. Every other conversion requires `CAST`.
+
+A `NULL` literal, and a parameter whose value is `null`, takes its type from its context: the other operand of an operator, or the common type of a `CASE`, `coalesce`, `IN` list or `UNION` column. Where nothing fixes it, as in `SELECT NULL`, its type is TEXT.
 
 ## Syntax
 
@@ -215,7 +217,7 @@ NULL and comparison rules:
 - **`x LIKE p`** is TRUE if `x` matches the whole of pattern `p`:
   - `%` matches any sequence of code points, and `_` matches exactly one.
   - ASCII letters match regardless of case; every other code point matches only itself.
-  - With `ESCAPE e`, `e` MUST be exactly one code point, and `e` followed by any code point matches that code point literally.
+  - With `ESCAPE e`, `e` MUST be a string literal or a parameter of exactly one code point; anything else makes the query invalid. In the pattern, `e` followed by any code point matches that code point literally.
 
 ### `CAST`
 
@@ -262,6 +264,7 @@ A `select-core` is **grouped** if it has `GROUP BY`, or if its result columns or
 
 - **Groups:** with `GROUP BY`, rows are grouped by the values of the `GROUP BY` expressions, with duplicates as defined above. Without it, all rows form one group, and that group exists even when there are no rows.
 - **Where aggregates may appear:** only in result columns, `HAVING` and `ORDER BY`, and never inside another aggregate.
+- **Grouping terms:** a `GROUP BY` term is resolved like an `order-term` (see below): an integer literal *k* is the *k*-th result column, a bare name that is a result column's name is that column, and anything else is an expression over the `FROM` sources.
 - **What a grouped expression may reference:** outside an aggregate's arguments, an expression MUST refer only to the `GROUP BY` expressions (matched as written, ignoring case and whitespace) or to columns listed bare in `GROUP BY`.
 - `HAVING` requires `GROUP BY`.
 
@@ -288,6 +291,8 @@ An `order-term` refers to one of three things:
 - any other expression, evaluated per row.
 
 After a `UNION` or `DISTINCT`, only the first two forms are allowed. Terms MUST be numeric or TEXT.
+
+A bare name that is both a result column's name and a column of a `FROM` source makes the query invalid, in `ORDER BY` and `GROUP BY` alike, unless the result column is that same source column.
 
 `ASC` is the default. NULLs sort first for `ASC` and last for `DESC`, unless `NULLS FIRST` or `NULLS LAST` says otherwise.
 
@@ -435,6 +440,27 @@ Relays SHOULD state the condition that would make the query acceptable. A declin
 
 Clients get the best service from queries that constrain every `events`/`tags` source by `kind`, `pubkey`, `id` or a tag `name`/`value`, and that use `ORDER BY created_at DESC` with a `LIMIT` for listings.
 
+## Conformance
+
+[`FF-conformance.json`](FF-conformance.json) holds this NIP's test vectors:
+- `events`: a corpus of signed events;
+- `cases`: queries run against that corpus.
+
+To check a relay:
+1. Start it empty, with every access restriction off.
+2. Publish every event in `events`.
+3. Run each case's `query` with its `params`.
+
+Each case either expects an answer or a refusal:
+- **An answer:** the relay MUST answer with exactly the case's `columns` (names and types) and `rows`.
+  - Rows are compared in order only when `ordered` is `true`; otherwise as a multiset.
+  - With `tolerance`, a REAL value may differ from the expected one by up to `tolerance` × max(1, |expected|).
+- **A refusal:** the relay MUST send `CLOSED` whose reason starts with the case's `error` value followed by `:`.
+
+A case with `sqlite_differs` states where SQLite on its own gives a different answer; see the implementation notes.
+
+A relay conforms when every case passes, apart from queries it declines with `unsupported:` for cost.
+
 ## Advertising
 
 Relays that implement this NIP include its number in `supported_nips` ([NIP-11](11.md)).
@@ -444,10 +470,10 @@ Relays that implement this NIP include its number in `supported_nips` ([NIP-11](
 Zap totals per zapped note, in sats:
 
 ```sql
-SELECT e.value AS note, count(*) AS zaps, sum(CAST(a.value AS INTEGER)) / 1000 AS sats
-FROM tags e JOIN tags a ON a.event_id = e.event_id AND a.name = 'amount'
-WHERE e.kind = 9735 AND e.name = 'e'
-GROUP BY e.value ORDER BY sats DESC LIMIT 20
+SELECT target.value AS note, count(*) AS zaps, sum(CAST(amount.value AS INTEGER)) / 1000 AS sats
+FROM tags AS target JOIN tags AS amount ON amount.event_id = target.event_id AND amount.name = 'amount'
+WHERE target.kind = 9735 AND target.name = 'e'
+GROUP BY target.value ORDER BY sats DESC LIMIT 20
 ```
 
 Write relays named in [NIP-65](65.md) lists, by how many authors use them:
@@ -462,10 +488,11 @@ GROUP BY value ORDER BY authors DESC LIMIT 100
 Reactions per note of one author, including notes with none:
 
 ```sql
-SELECT n.id, count(r.event_id) AS reactions
-FROM events n LEFT JOIN tags r ON r.value = n.id AND r.kind = 7 AND r.name = 'e'
-WHERE n.kind = 1 AND n.pubkey = ?
-GROUP BY n.id ORDER BY reactions DESC
+SELECT notes.id, count(reactions.event_id) AS total
+FROM events AS notes LEFT JOIN tags AS reactions
+  ON reactions.value = notes.id AND reactions.kind = 7 AND reactions.name = 'e'
+WHERE notes.kind = 1 AND notes.pubkey = ?
+GROUP BY notes.id ORDER BY total DESC
 ```
 
 The `created_at` of each author's newest kind `0`:
@@ -493,6 +520,7 @@ This section is non-normative.
 | INTEGER overflow in `+ - *` | SQLite switches to REAL | Emit `iif(typeof(r) = 'integer', r, NULL)` around the operation |
 | `abs` of the smallest INTEGER | SQLite fails the statement | Emit `CASE WHEN x = -9223372036854775808 THEN NULL ELSE abs(x) END` |
 | Mixed-type comparisons | SQLite allows them | Rejected by the type check |
+| Numeric promotion in `CASE`, `coalesce`, `ifnull` and `UNION` | SQLite keeps an INTEGER value INTEGER even where the result is REAL, so `(CASE WHEN c THEN 1 ELSE 2.5 END) / 2` divides as integers | Wrap the INTEGER branches in `CAST(… AS REAL)` |
 | Infinity in results | SQLite prints REAL infinity as `Inf` | Map it to the spelling defined under [Protocol](#protocol) |
 
 **Stores that are not SQLite.** Such a store can still answer the language:
