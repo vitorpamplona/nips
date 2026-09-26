@@ -39,6 +39,12 @@ FROM events AS notes LEFT JOIN tags AS reactions
 WHERE notes.kind = 1 AND notes.pubkey = ?
 GROUP BY notes.id ORDER BY total DESC
 
+-- One provider's rank assertions (NIP-85), 1000 targets per page
+SELECT e.d AS target, CAST(r.t1 AS INTEGER) AS rank
+FROM events AS e JOIN tags AS r ON r.event_id = e.id AND r.t0 = 'rank'
+WHERE e.kind = 30382 AND e.pubkey = ? AND e.d > ?
+ORDER BY target LIMIT 1000
+
 -- The newest kind 0 of each of three authors
 SELECT pubkey, max(created_at) AS newest FROM events WHERE kind = 0 AND pubkey IN (?, ?, ?) GROUP BY pubkey
 ```
@@ -61,8 +67,9 @@ These events are visible through exactly two sources.
 | `kind`       | INTEGER | the event's `kind`                  |
 | `content`    | TEXT    | the event's `content`               |
 | `sig`        | TEXT    | the event's `sig`                   |
+| `d`          | TEXT    | the event's `d` identifier, or NULL |
 
-None of these columns is ever NULL.
+`d` is the identifier that addresses an addressable event ([NIP-01](01.md), kinds `30000` to `39999`) together with its `kind` and `pubkey`: the value of the event's first `d` tag that has one, or `''` when none has. It is NULL for every other kind. Relays already index it to replace addressable events, so `kind`, `pubkey` and `d` together read one index. No other column is ever NULL.
 
 ### `tags`: one row per tag of every event
 
@@ -109,7 +116,7 @@ The relay answers with one message:
 
 - `type` is `"INTEGER"`, `"REAL"`, `"TEXT"` or `"BOOLEAN"`.
 - Values are JSON numbers, strings, `true`/`false` or `null`. Clients MUST read INTEGER values as 64-bit integers; a REAL value is written with enough digits to read back as the same binary64 value.
-- A relay MAY cap the number of rows it sends. It then sends the first rows of the result, in the query's `ORDER BY` order, and sets `truncated` to `true`. To read further, clients repeat the query with a condition past the last row received (for example `created_at < ?`) or with `OFFSET`.
+- A relay MAY cap the number of rows it sends. It then sends the first rows of the result, in the query's `ORDER BY` order, and sets `truncated` to `true`. To read further, clients repeat the query with a condition past the last row received (for example `created_at < ?`, or `d > ?` over addressable events) or with `OFFSET`. A condition on an indexed column keeps every page as cheap as the first; `OFFSET`, or an order on a computed value such as `CAST(t1 AS INTEGER)`, makes the relay produce and sort the skipped rows again for each page.
 
 A relay that does not answer a query sends `CLOSED` instead:
 
@@ -351,12 +358,12 @@ So `substr('abcdef', 2, 3)` is `'bcd'`, `substr('abcdef', 0, 2)` is `'a'`, and `
 
 A relay MAY decline any valid query it judges too expensive with `unsupported:`, for example:
 
-- a query that reads a source without a condition on `id`/`event_id`, `pubkey`, `kind` or a tag's `t0`/`t1`;
+- a query that reads a source without a condition on `id`/`event_id`, `pubkey`, `kind`, `d` or a tag's `t0`/`t1`;
 - a query that exceeds the relay's time or memory budget.
 
 Relays SHOULD state the condition that would make the query acceptable. A declined query is not a wrong answer. A relay that answers MUST answer exactly as this NIP specifies.
 
-Clients get the best service from queries that constrain every source by `kind`, `pubkey`, `id` or a tag's `t0`/`t1`, and from listings that use `ORDER BY created_at DESC` with a `LIMIT`.
+Clients get the best service from queries that constrain every source by `kind`, `pubkey`, `id`, `d` or a tag's `t0`/`t1`, and from listings that use `ORDER BY created_at DESC`, or `ORDER BY d` over one author's addressable events, with a `LIMIT`.
 
 ## Conformance
 
@@ -389,7 +396,7 @@ In every design, parse and type-check the query yourself, and never hand the cli
 
 ### PostgreSQL
 
-Expose the relay's events as `events` and `tags` relations with `int8` and `text` columns under the `C` collation (for example, create the database with `LOCALE 'C'`). Then translate the checked query into SQL:
+Expose the relay's events as `events` and `tags` relations with `int8` and `text` columns under the `C` collation (for example, create the database with `LOCALE 'C'`). Store `d` in a column set on insert and index `(kind, pubkey, d)`, the index that also replaces addressable events. Then translate the checked query into SQL:
 
 - Emit every expression fully parenthesized, INTEGER literals as `n::int8`, REAL literals as `x::float8`, and the types INTEGER and REAL as `int8` and `float8`.
 - Bind the parameters with their types.
@@ -415,7 +422,7 @@ PostgreSQL then applies these rules on its own: NULL ordering, `round`, errors f
 
 A relay whose events sit in LMDB, RocksDB or a similar store keeps the indexes it already has for `REQ` and evaluates the query itself:
 
-1. Read each `events` or `tags` source through the index that its constant conditions (`id`/`event_id`, `pubkey`, `kind`, `t0` with `t1`, and `created_at` bounds) select, exactly as it would read a NIP-01 filter. Decline with `unsupported:` when no index applies.
+1. Read each `events` or `tags` source through the index that its constant conditions (`id`/`event_id`, `pubkey`, `kind`, `t0` with `t1`, and `created_at` bounds) select, exactly as it would read a NIP-01 filter. `kind`, `pubkey` and `d` read the index that replaces addressable events, in `d` order. Decline with `unsupported:` when no index applies.
 2. Evaluate everything else in a small interpreter over typed values:
    - joins by index lookups on the join key (an event by `id`, tag rows by `t0`/`t1` or `event_id`);
    - grouping in a hash map;
