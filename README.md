@@ -319,8 +319,6 @@ This table is not exhaustive. For a machine-readable registry of all known event
 | `AUTH`  | used to send authentication events                  | [42](42.md) |
 | `COUNT` | used to request event counts                        | [45](45.md) |
 | `NQL`   | used to run a read-only query over events           | [FF](FF.md) |
-| `NQL-FETCH` | used to request the next page of a query        | [FF](FF.md) |
-| `NQL-CLOSE` | used to discard a query                         | [FF](FF.md) |
 
 ### Relay to Client
 
@@ -333,8 +331,7 @@ This table is not exhaustive. For a machine-readable registry of all known event
 | `CLOSED` | used to notify clients that a REQ was ended and why     | [01](01.md) |
 | `AUTH`   | used to send authentication challenges                  | [42](42.md) |
 | `COUNT`  | used to send requested event counts to clients          | [45](45.md) |
-| `NQL-COLS` | used to send a query's column names and types          | [FF](FF.md) |
-| `NQL-ROWS` | used to send a page of a query's rows                  | [FF](FF.md) |
+| `NQL`    | used to send a query's result to clients                | [FF](FF.md) |
 
 ## Criteria for acceptance in this repository
 

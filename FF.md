@@ -6,13 +6,44 @@ Nostr Query Language (NQL)
 
 `draft` `optional` `relay`
 
-This NIP defines NQL, a small, strictly typed, read-only query language over Nostr events, and the relay commands that run it. NQL's syntax is a subset of SQL's `SELECT`, but it is not a general database language: its only data are the events a relay holds, seen through two fixed sources, `events` and `tags`. There are no user tables, no schema, no writes and no extensions.
+This NIP defines NQL, a small, strictly typed, read-only query language over the events a relay holds, and one command to run it. NQL looks like SQL's `SELECT` and means what SQL would mean, but it is closed: its only data are two fixed views of Nostr events, `events` and `tags`, and it has no user tables, no writes and no extensions.
 
-A relay that supports this NIP MUST implement **everything** defined here, and nothing it answers may differ from what this document specifies. Clients can therefore send the same query to any supporting relay. The language is closed: it grows only by revising this NIP.
+A relay that supports this NIP MUST implement all of it, and every answer it gives MUST be the one this document specifies, so a client can send the same query to any supporting relay.
 
 ## Motivation
 
-`REQ` returns events matching a filter; `COUNT` ([NIP-45](45.md)) returns how many. Neither can group, aggregate, join an event to the events its tags reference, read a tag beyond its first value, or compute over tag values. Clients answer those questions by downloading every matching event: all reactions to count them per note, all kind `10002` lists to collect relay urls, all zap receipts to sum their amounts. NQL moves that work to the relay and returns only the answer.
+`REQ` returns events matching a filter, and `COUNT` ([NIP-45](45.md)) returns how many. Neither can group, aggregate, join an event to the events its tags point at, read a tag past its first value, or compute over tag values. Clients answer such questions by downloading every matching event: all reactions to count them per note, all kind `10002` lists to collect relay urls, all zap receipts to add up their amounts. NQL moves that work to the relay and returns only the answer.
+
+## Overview
+
+The client sends a query; the relay answers with typed columns and rows:
+
+```
+["NQL", "q1", "SELECT t1 AS relay, count(DISTINCT pubkey) AS authors FROM tags WHERE kind = 10002 AND t0 = 'r' GROUP BY t1 ORDER BY authors DESC LIMIT 2"]
+["NQL", "q1", {"columns": [["relay", "TEXT"], ["authors", "INTEGER"]], "rows": [["wss://relay.damus.io", 91234], ["wss://nos.lol", 80112]], "truncated": false}]
+```
+
+More queries:
+
+```sql
+-- Zap totals per zapped note, in sats
+SELECT target.t1 AS note, count(*) AS zaps, sum(CAST(amount.t1 AS INTEGER)) / 1000 AS sats
+FROM tags AS target JOIN tags AS amount ON amount.event_id = target.event_id AND amount.t0 = 'amount'
+WHERE target.kind = 9735 AND target.t0 = 'e'
+GROUP BY target.t1 ORDER BY sats DESC LIMIT 20
+
+-- Reactions per note of one author, including notes with none
+SELECT notes.id, count(reactions.event_id) AS total
+FROM events AS notes LEFT JOIN tags AS reactions
+  ON reactions.t1 = notes.id AND reactions.kind = 7 AND reactions.t0 = 'e'
+WHERE notes.kind = 1 AND notes.pubkey = ?
+GROUP BY notes.id ORDER BY total DESC
+
+-- The newest kind 0 of each of three authors
+SELECT pubkey, max(created_at) AS newest FROM events WHERE kind = 0 AND pubkey IN (?, ?, ?) GROUP BY pubkey
+```
+
+Readers who know SQL need the [data model](#data-model), the [protocol](#protocol) and [NQL for SQL users](#nql-for-sql-users). The [language reference](#language-reference) defines each rule precisely for implementers, and the [conformance vectors](#conformance) test them.
 
 ## Data model
 
@@ -35,387 +66,52 @@ None of these columns is ever NULL.
 
 ### `tags`: one row per tag of every event
 
-| Column       | Type    | Value                                                     |
-|--------------|---------|-----------------------------------------------------------|
-| `event_id`   | TEXT    | the `id` of the event holding the tag                     |
-| `idx`        | INTEGER | the tag's 0-based position in that event's `tags` array   |
-| `t0`         | TEXT    | `tag[0]`, the tag's name                                  |
-| `t1`         | TEXT    | `tag[1]`, or NULL when absent                             |
-| `t2`         | TEXT    | `tag[2]`, or NULL when absent                             |
-| `t3`         | TEXT    | `tag[3]`, or NULL when absent                             |
-| `t4`         | TEXT    | `tag[4]`, or NULL when absent                             |
-| `created_at` | INTEGER | the holding event's `created_at`                          |
-| `kind`       | INTEGER | the holding event's `kind`                                |
-| `pubkey`     | TEXT    | the holding event's `pubkey`                              |
-
-A tag that is an empty array has no row. Elements past `tag[4]` are not visible. A NIP-01 filter's `#x` condition is `t0 = 'x' AND t1 IN (…)`. `created_at`, `kind` and `pubkey` repeat the holding event's fields so that most tag questions need no join.
-
-## Types and values
-
-Every value has one of four types:
-
-- **INTEGER**: a signed 64-bit integer.
-- **REAL**: an IEEE 754 binary64 number, including ±Infinity. NQL never produces NaN.
-- **TEXT**: a sequence of Unicode code points. Lengths, positions and ordering are in code points.
-- **BOOLEAN**: `TRUE` or `FALSE`.
-
-`NULL` is the absence of a value and belongs to every type. INTEGER and REAL are the *numeric* types.
-
-Every expression has a single static type, determined before execution by the rules below. A query that breaks a typing rule is invalid and MUST be refused before any row is produced.
-
-The only implicit conversion is **numeric promotion**: where an operator or function accepts two numeric operands of different types, the INTEGER operand is converted to REAL. Every other conversion requires `CAST`.
-
-A `NULL` literal, and a parameter whose value is `null`, takes its type from its context: the other operand of an operator, or the common type of a `CASE`, `coalesce`, `IN` list or `UNION` column. Where nothing fixes it, as in `SELECT NULL`, its type is TEXT.
-
-## Syntax
-
-A query is a single statement, optionally followed by one `;`. Keywords and identifiers are case-insensitive. Whitespace separates tokens; there are no comments.
-
-```
-query         = select-core { "UNION" [ "ALL" ] select-core } [ order-by ] [ limit ]
-select-core   = "SELECT" [ "DISTINCT" | "ALL" ] result-column { "," result-column }
-                [ "FROM" from ]
-                [ "WHERE" expr ]
-                [ "GROUP" "BY" expr { "," expr } [ "HAVING" expr ] ]
-result-column = "*" | name "." "*" | expr [ [ "AS" ] name ]
-from          = source { ( "," | "CROSS" "JOIN" ) source
-                       | ( [ "INNER" ] "JOIN" | "LEFT" [ "OUTER" ] "JOIN" ) source "ON" expr }
-source        = ( "events" | "tags" ) [ [ "AS" ] name ]
-              | "(" query ")" [ "AS" ] name
-order-by      = "ORDER" "BY" order-term { "," order-term }
-order-term    = expr [ "ASC" | "DESC" ] [ "NULLS" ( "FIRST" | "LAST" ) ]
-limit         = "LIMIT" expr [ "OFFSET" expr ]
-
-expr          = or-expr
-or-expr       = and-expr { "OR" and-expr }
-and-expr      = not-expr { "AND" not-expr }
-not-expr      = "NOT" not-expr | equality
-equality      = relation { equality-op relation
-                         | "IS" [ "NOT" ] relation
-                         | [ "NOT" ] "IN" "(" ( query | expr { "," expr } ) ")"
-                         | [ "NOT" ] "LIKE" relation [ "ESCAPE" relation ]
-                         | [ "NOT" ] "BETWEEN" relation "AND" relation }
-equality-op   = "=" | "!=" | "<>"
-relation      = additive { ( "<" | "<=" | ">" | ">=" ) additive }
-additive      = multiplicative { ( "+" | "-" ) multiplicative }
-multiplicative= concat { ( "*" | "/" | "%" ) concat }
-concat        = unary { "||" unary }
-unary         = ( "-" | "+" ) unary | primary
-primary       = literal | parameter | column | call | cast | case
-              | "(" expr ")" | "(" query ")" | "EXISTS" "(" query ")"
-column        = [ name "." ] name
-call          = function-name "(" [ [ "DISTINCT" ] expr { "," expr } | "*" ] ")"
-cast          = "CAST" "(" expr "AS" ( "INTEGER" | "REAL" | "TEXT" ) ")"
-case          = "CASE" [ expr ] "WHEN" expr "THEN" expr { "WHEN" expr "THEN" expr }
-                [ "ELSE" expr ] "END"
-literal       = integer | real | string | "NULL" | "TRUE" | "FALSE"
-parameter     = "?" | ":" name
-```
-
-Binary operators on the same line of the grammar are left-associative. The `AND` inside `BETWEEN` belongs to `BETWEEN`; its operands are `relation`s, so `x BETWEEN a AND b AND c` means `(x BETWEEN a AND b) AND c`.
-
-Lexical rules:
-
-- **Names** match `[A-Za-z_][A-Za-z0-9_]*` and MUST NOT be a keyword. The keywords are: `ALL AND AS ASC BETWEEN BY CASE CAST CROSS DESC DISTINCT ELSE END ESCAPE EXISTS FALSE FIRST FROM GROUP HAVING IN INNER INTEGER IS JOIN LAST LEFT LIKE LIMIT NOT NULL NULLS OFFSET ON OR ORDER OUTER REAL SELECT TEXT THEN TRUE UNION WHEN WHERE`.
-- **Integers** are one or more decimal digits and MUST fit in a signed 64-bit integer. The one exception is `9223372036854775808`, which is valid only directly after a unary `-`.
-- **Reals** are `digits "." [digits] [exponent]`, `"." digits [exponent]` or `digits exponent`, where `exponent = ("e" | "E") ["+" | "-"] digits`. They round to the nearest binary64 value.
-- **Strings** are enclosed in single quotes; `''` inside a string stands for one quote. There are no other escapes.
-- **Parameters** are either all `?` or all `:name` within one query. The n-th `?` takes the n-th positional parameter; `:name` takes the named one.
-
-## Semantics
-
-### Names and scopes
-
-Each `source` in a `FROM` has a name: its alias, or `events`/`tags` when it has none. Names within one `FROM` MUST be unique. A subquery in `FROM` MUST have an alias; its columns are its result columns, named as defined under [Result columns](#result-columns).
-
-A qualified column `s.c` refers to column `c` of source `s`. An unqualified column `c` refers to the only source in the innermost enclosing `FROM` that has a column `c`. If no source there has one, the next enclosing query's `FROM` is searched (a correlated reference). If two sources at the same level have it, the query is invalid. A reference that resolves nowhere makes the query invalid.
-
-### Evaluation
-
-A `select-core` behaves as follows:
-
-1. The `FROM` sources are combined left to right:
-   - `,` and `CROSS JOIN` pair every row with every row.
-   - `JOIN … ON` keeps the pairs whose `ON` is TRUE.
-   - `LEFT JOIN … ON` also keeps each left row that matched nothing, paired with NULLs.
-2. `WHERE` keeps the rows for which it is TRUE.
-3. Rows are grouped (see [Grouping](#grouping-and-aggregates)).
-4. `HAVING` keeps the groups for which it is TRUE.
-5. The result columns are computed, and `DISTINCT` removes duplicate rows.
-
-`SELECT` without `FROM` yields exactly one row. `UNION ALL` concatenates results; `UNION` also removes duplicate rows. Then `ORDER BY` sorts the whole result, and `LIMIT`/`OFFSET` select a slice of it.
-
-`WHERE`, `HAVING`, `ON`, `NOT`, `AND`, `OR` and `CASE … WHEN` conditions MUST be BOOLEAN.
-
-Without `ORDER BY`, the row order is unspecified. With it, the order of rows that compare equal on every term is unspecified.
-
-Two values are **duplicates** (for `DISTINCT`, `UNION` and `GROUP BY`) when they are equal or both NULL.
-
-### Result columns
-
-A query MUST NOT have more than one `*` result column that expands to the same source.
-
-- `*` expands to every column of every `FROM` source, in `FROM` order and table order.
-- `s.*` expands to every column of source `s`.
-
-Each result column is named:
-
-- by its alias, if it has one;
-- otherwise by the column's name, if the expression is a bare column;
-- otherwise by the expression's text exactly as written in the query, from its first to its last character.
-
-In a `UNION`, all `select-core`s MUST have the same number of columns. Each column's type is the common type of that column in every core (see [Common type](#common-type)). The names come from the first core.
-
-### Common type
-
-Where the rules ask for the *common type* of several expressions:
-
-- If all are NULL literals, the common type is TEXT.
-- Otherwise the NULL literals take the type of the others.
-- If all the others are numeric and at least one is REAL, the common type is REAL.
-- Otherwise all of them MUST have the same type.
-
-### Operators
-
-In the tables below, *N* is any numeric type.
-
-| Operator | Operands | Result | Notes |
-|---|---|---|---|
-| `+` `-` `*` | N, N | INTEGER if both are INTEGER, else REAL | |
-| `/` | N, N | INTEGER if both are INTEGER, else REAL | INTEGER division truncates toward zero |
-| `%` | INTEGER, INTEGER | INTEGER | the result has the sign of the left operand |
-| unary `-`, `+` | N | same type | |
-| `\|\|` | TEXT, TEXT | TEXT | concatenation |
-| `=` `!=` `<>` | any common type | BOOLEAN | |
-| `<` `<=` `>` `>=` | numeric, or TEXT, TEXT | BOOLEAN | |
-| `IS`, `IS NOT` | any common type | BOOLEAN | never NULL (see below) |
-| `IN`, `NOT IN` | any common type | BOOLEAN | |
-| `BETWEEN` | numeric, or all TEXT | BOOLEAN | |
-| `LIKE` | TEXT, TEXT [, `ESCAPE` TEXT] | BOOLEAN | |
-| `NOT` | BOOLEAN | BOOLEAN | |
-| `AND`, `OR` | BOOLEAN, BOOLEAN | BOOLEAN | |
-
-Numeric rules:
-
-- **Division or remainder by zero** (INTEGER or REAL) yields NULL.
-- **INTEGER overflow**: an INTEGER `+`, `-`, `*`, unary `-` or `abs()` whose exact result does not fit in 64 bits yields NULL.
-- **Infinity**: REAL arithmetic follows IEEE 754, so it may produce ±Infinity but never NaN.
-
-NULL and comparison rules:
-
-- Every operator except `IS`, `IS NOT`, `AND` and `OR` yields NULL when any operand is NULL.
-- `a IS b` is TRUE when `a` and `b` are equal or both NULL, and FALSE otherwise; `IS NOT` is its negation.
-- `AND` and `OR` use three-valued logic: `FALSE AND NULL` is FALSE and `TRUE OR NULL` is TRUE; every other combination with NULL is NULL.
-- TEXT compares code point by code point, and a string sorts before any longer string that starts with it. Numbers compare by value, after numeric promotion. BOOLEAN supports only equality, `IS` and `IN`.
-
-`IN`, `BETWEEN` and `LIKE`:
-
-- **`x IN (…)`** is TRUE if `x` equals any element. It is NULL if no element equals `x` and either `x` or some element is NULL. It is FALSE otherwise.
-  - `IN (query)`: the query MUST have exactly one column, and its elements are that column's values.
-  - `NOT IN` is the negation of `IN`, with NULL staying NULL.
-- **`x BETWEEN a AND b`** is `x >= a AND x <= b`.
-- **`x LIKE p`** is TRUE if `x` matches the whole of pattern `p`:
-  - `%` matches any sequence of code points, and `_` matches exactly one.
-  - ASCII letters match regardless of case; every other code point matches only itself.
-  - With `ESCAPE e`, `e` MUST be a string literal or a parameter of exactly one code point; anything else makes the query invalid. In the pattern, `e` followed by any code point matches that code point literally.
-
-### `CAST`
-
-| From \ To | INTEGER | REAL | TEXT |
-|---|---|---|---|
-| INTEGER | itself | the nearest REAL | decimal digits, with a leading `-` if negative |
-| REAL | toward zero; ±Infinity and out-of-range values saturate to the INTEGER limits | itself | *invalid* |
-| TEXT | see below | see below | itself |
-| BOOLEAN | `TRUE` → 1, `FALSE` → 0 | *invalid* | *invalid* |
-
-NULL casts to NULL.
-
-**TEXT to INTEGER:**
-1. Skip leading whitespace.
-2. Read an optional `+` or `-`, then the longest run of decimal digits.
-3. If there are no digits, the result is 0.
-4. A value beyond the 64-bit range saturates to the nearest limit.
-5. Everything after the digits is ignored, so `'12abc'` → 12, `'3.9'` → 3, `'1e3'` → 1 and `'abc'` → 0.
-
-**TEXT to REAL:**
-1. Skip leading whitespace.
-2. Read the longest prefix that forms an optionally signed `integer` or `real` literal.
-3. The result is its value, or 0.0 when there is none. `'1.5e2x'` → 150.0.
-
-REAL to TEXT is not part of the language.
-
-### `CASE`
-
-`CASE WHEN c1 THEN r1 … [ELSE e] END` yields the first `r` whose `c` is TRUE. If none is, it yields `e`, or NULL when there is no `ELSE`.
-
-`CASE x WHEN v1 THEN r1 …` is the same as `CASE WHEN x = v1 THEN r1 …`, except that `x` is evaluated once.
-
-The `THEN` and `ELSE` results MUST have a common type, which is the type of the `CASE`.
-
-### Subqueries
-
-- A subquery used as a value MUST have exactly one column, and its type is that column's type. It yields the value in the first row of its result, or NULL when there is no row.
-- `EXISTS (query)` is TRUE if the query yields at least one row, and FALSE otherwise.
-- Subqueries may refer to the columns of enclosing queries.
-
-### Grouping and aggregates
-
-A `select-core` is **grouped** if it has `GROUP BY`, or if its result columns or `HAVING` contain an aggregate call.
-
-- **Groups:** with `GROUP BY`, rows are grouped by the values of the `GROUP BY` expressions, with duplicates as defined above. Without it, all rows form one group, and that group exists even when there are no rows.
-- **Where aggregates may appear:** only in result columns, `HAVING` and `ORDER BY`, and never inside another aggregate.
-- **Grouping terms:** a `GROUP BY` term is resolved like an `order-term` (see below): an integer literal *k* is the *k*-th result column, a bare name that is a result column's name is that column, and anything else is an expression over the `FROM` sources.
-- **What a grouped expression may reference:** outside an aggregate's arguments, an expression MUST refer only to the `GROUP BY` expressions (matched as written, ignoring case and whitespace) or to columns listed bare in `GROUP BY`.
-- `HAVING` requires `GROUP BY`.
-
-The aggregates, where *x* is any expression:
-
-| Aggregate | Argument | Result | Value |
-|---|---|---|---|
-| `count(*)` | none | INTEGER | the number of rows in the group |
-| `count(x)` | any | INTEGER | the number of non-NULL `x` |
-| `sum(x)` | N | same type as `x` | the sum of non-NULL `x`, or NULL if there are none. An INTEGER sum that overflows fails the query (`error:`). A REAL sum uses compensated (Kahan–Babuška–Neumaier) summation |
-| `avg(x)` | N | REAL | the compensated sum of non-NULL `x` divided by their count, or NULL if there are none |
-| `min(x)`, `max(x)` | N or TEXT | same type as `x` | the least or greatest non-NULL `x`, or NULL if there are none |
-
-With `DISTINCT` (for example `count(DISTINCT x)`), the aggregate considers each distinct non-NULL value once.
-
-Row order within a group is unspecified, so a REAL `sum` or `avg` may differ in the last bits between relays. INTEGER results are exact.
-
-### `ORDER BY`, `LIMIT`, `OFFSET`
-
-An `order-term` refers to one of three things:
-
-- an integer literal *k*, meaning the *k*-th result column (1-based);
-- a bare name that is a result column's name, meaning that column;
-- any other expression, evaluated per row.
-
-After a `UNION` or `DISTINCT`, only the first two forms are allowed. Terms MUST be numeric or TEXT.
-
-A bare name that is both a result column's name and a column of a `FROM` source makes the query invalid, in `ORDER BY` and `GROUP BY` alike, unless the result column is that same source column.
-
-`ASC` is the default. NULLs sort first for `ASC` and last for `DESC`, unless `NULLS FIRST` or `NULLS LAST` says otherwise.
-
-`LIMIT` and `OFFSET` MUST be INTEGER expressions that use only literals and parameters. Their values MUST be non-negative, or the query is invalid.
-
-## Functions
-
-These are all the functions; no other name is callable. In the signatures, *N* is any numeric type. Every function returns NULL when any argument is NULL, except `coalesce`, `ifnull` and `nullif`. An argument of the wrong type makes the query invalid.
-
-### Text
-
-| Function | Result | Value |
-|---|---|---|
-| `length(TEXT)` | INTEGER | the number of code points |
-| `lower(TEXT)`, `upper(TEXT)` | TEXT | ASCII letters converted; every other code point unchanged |
-| `trim(TEXT [, TEXT])`, `ltrim(…)`, `rtrim(…)` | TEXT | removes, from both ends / the start / the end, every code point that appears in the second argument (a space when omitted) |
-| `replace(x TEXT, from TEXT, to TEXT)` | TEXT | `x` with every non-overlapping occurrence of `from`, scanned left to right, replaced by `to`; `x` unchanged when `from` is empty |
-| `instr(x TEXT, y TEXT)` | INTEGER | the 1-based position of the first occurrence of `y` in `x`: 0 if there is none, 1 if `y` is empty |
-| `substr(x TEXT, start INTEGER [, len INTEGER])` | TEXT | see below |
-
-`substr` counts in code points. With `L` = `length(x)`, `p` = `start`, and `n` = `len` (unbounded when omitted), it computes as follows and returns code points `[p, p + n)` of `x` (0-based), clipped to `[0, L)`:
-
-```
-neg = n < 0;   if neg: n = -n
-if p < 0:      p = p + L;  if p < 0: n = max(0, n + p); p = 0
-else if p > 0: p = p - 1
-else if n > 0: n = n - 1        # start 0 selects one fewer code point
-if neg:        p = p - n;  if p < 0: n = n + p; p = 0
-```
-
-So `substr('abcdef', 2, 3)` = `'bcd'`, `substr('abcdef', 0, 2)` = `'a'`, `substr('abcdef', -2)` = `'ef'`, `substr('abcdef', 3, -2)` = `'ab'` and `substr('abcdef', -10, 3)` = `''`.
-
-### Conditional
-
-| Function | Result | Value |
-|---|---|---|
-| `coalesce(x, y, …)` (2 or more arguments) | common type | the first non-NULL argument, or NULL |
-| `ifnull(x, y)` | common type | `coalesce(x, y)` |
-| `nullif(x, y)` | type of `x` | NULL if `x = y` is TRUE, otherwise `x`; `x` and `y` MUST have a common type |
-
-### Numeric
-
-| Function | Result | Value |
-|---|---|---|
-| `abs(N)` | same type | the absolute value; `abs` of the smallest INTEGER is NULL |
-| `sign(N)` | INTEGER | -1, 0 or 1 |
-| `round(N [, INTEGER])` | REAL | the argument rounded to the given number of decimal places (default 0; values below 0 count as 0 and above 30 as 30). Ties go away from zero, judged on the exact binary value, so `round(2.675, 2)` = 2.67 because the stored value is just below 2.675 |
-| `ceil(N)`, `ceiling(N)`, `floor(N)`, `trunc(N)` | same type | toward +∞, toward -∞, toward zero; INTEGER arguments are returned unchanged |
-| `mod(N, N)` | REAL | the remainder of truncating division, with the sign of the first argument (`fmod`); NULL when the second argument is 0 |
-| `pi()` | REAL | π |
-| `sqrt(N)` | REAL | the square root |
-| `exp(N)` | REAL | *e*^x |
-| `pow(N, N)`, `power(N, N)` | REAL | x^y |
-| `ln(N)` | REAL | the natural logarithm |
-| `log(N)`, `log10(N)` | REAL | the base-10 logarithm |
-| `log(b N, x N)` | REAL | the base-*b* logarithm of *x* |
-| `log2(N)` | REAL | the base-2 logarithm |
-| `degrees(N)`, `radians(N)` | REAL | angle conversion |
-| `sin` `cos` `tan` `asin` `acos` `atan` `sinh` `cosh` `tanh` `asinh` `acosh` `atanh` (N) | REAL | the trigonometric and hyperbolic functions, in radians |
-| `atan2(y N, x N)` | REAL | the angle of the point (x, y), in radians |
-
-Every REAL function yields NULL outside its mathematical domain, and wherever the IEEE 754 result would be NaN. Examples: `sqrt(-1)`, `ln(0)`, `ln(-1)`, `acos(2)`, `acosh(0.5)`, `pow(-8, 1.0/3)`, `log(1, 5)`, `log(0, 5)`.
-
-Overflow and poles yield ±Infinity, as IEEE 754 does: `exp(1000)`, `pow(10, 400)`, `pow(0, -1)`, `atanh(1)`.
-
-Results of `exp`, `ln`, `log*`, `pow`, `sqrt` and the trigonometric functions MUST be within one unit in the last place of the exact result. Clients MUST NOT expect them to be bit-identical across relays.
+| Column       | Type    | Value                                                   |
+|--------------|---------|---------------------------------------------------------|
+| `event_id`   | TEXT    | the `id` of the event holding the tag                   |
+| `idx`        | INTEGER | the tag's 0-based position in that event's `tags` array |
+| `t0`         | TEXT    | `tag[0]`, the tag's name                                |
+| `t1`         | TEXT    | `tag[1]`, or NULL when absent                           |
+| `t2`         | TEXT    | `tag[2]`, or NULL when absent                           |
+| `t3`         | TEXT    | `tag[3]`, or NULL when absent                           |
+| `t4`         | TEXT    | `tag[4]`, or NULL when absent                           |
+| `created_at` | INTEGER | the holding event's `created_at`                        |
+| `kind`       | INTEGER | the holding event's `kind`                              |
+| `pubkey`     | TEXT    | the holding event's `pubkey`                            |
+
+A tag that is an empty array has no row, and elements past `tag[4]` are not visible. A NIP-01 filter's `#x` condition is `t0 = 'x' AND t1 IN (…)`. `created_at`, `kind` and `pubkey` repeat the holding event's fields so that most tag questions need no join.
 
 ## Protocol
 
-### Running a query
-
 ```
-["NQL", <query_id>, <query>, <options>?]
+["NQL", <query_id>, <query>, <params>?]
 ```
 
-- `query_id` is an arbitrary non-empty string, with the same scoping as a `REQ` subscription id.
+- `query_id` is an arbitrary non-empty string, scoped like a `REQ` subscription id. A client MUST NOT reuse it until the query is answered.
 - `query` is the query text.
-- `options` is an optional object with two optional fields:
-  - `params`: a JSON array of positional parameters, or an object of named parameters.
-  - `page`: the maximum number of rows to send first.
+- `params`, when present, is a JSON array holding the value of each `?` in the query, in order. It MUST have exactly as many elements as the query has `?`.
 
-Each parameter's type comes from its JSON value:
+A parameter's type comes from its JSON value:
 
 | JSON value | Type |
 |---|---|
-| an integer within the 64-bit range | INTEGER |
+| a number without a fraction or exponent, within the 64-bit range | INTEGER |
 | any other number | REAL |
 | a string | TEXT |
 | `true` / `false` | BOOLEAN |
-| `null` | NULL, compatible with any type |
+| `null` | NULL, typed by its context as a `NULL` literal is |
 
-A query that references a parameter it was not given is invalid.
-
-When the relay accepts the query, it replies with the result's column names and types, then the first page of rows:
+The relay answers with one message:
 
 ```
-["NQL-COLS", <query_id>, [[<name>, <type>], ...]]
-["NQL-ROWS", <query_id>, [[<value>, ...], ...], "more" | "done"]
+["NQL", <query_id>, {"columns": [[<name>, <type>], ...], "rows": [[<value>, ...], ...], "truncated": <boolean>}]
 ```
 
 - `type` is `"INTEGER"`, `"REAL"`, `"TEXT"` or `"BOOLEAN"`.
-- Values are JSON integers, numbers, strings, `true`/`false` or `null`.
-- ±Infinity, which JSON cannot carry, is sent as the string `"Infinity"` or `"-Infinity"` in a REAL column.
-- Clients MUST parse INTEGER values as 64-bit integers.
+- Values are JSON numbers, strings, `true`/`false` or `null`. Clients MUST read INTEGER values as 64-bit integers; a REAL value is written with enough digits to read back as the same binary64 value.
+- A relay MAY cap the number of rows it sends. It then sends the first rows of the result, in the query's `ORDER BY` order, and sets `truncated` to `true`. To read further, clients repeat the query with a condition past the last row received (for example `created_at < ?`) or with `OFFSET`.
 
-The first page holds at most `page` rows. Without `page`, the relay chooses the size, which SHOULD be the default `limit` it applies to `REQ`.
-
-### Paging
-
-`"done"` means there are no more rows; the relay has discarded the query, and `query_id` can be reused. `"more"` means rows remain. The client then either asks for the next page or discards the query:
-
-```
-["NQL-FETCH", <query_id>, <max_rows>]
-["NQL-CLOSE", <query_id>]
-```
-
-`NQL-FETCH` is answered with another `NQL-ROWS`. A relay MAY discard a query that waits too long for its next `NQL-FETCH`; it then sends `CLOSED` with the `closed:` prefix.
-
-Sending `NQL` with an id that is still open replaces the previous query. Closing the connection discards all of its queries.
-
-### Refusals and errors
-
-A relay that does not run a query, or stops running one, answers with `CLOSED`:
+A relay that does not answer a query sends `CLOSED` instead:
 
 ```
 ["CLOSED", <query_id>, "<prefix>: <human-readable reason>"]
@@ -423,11 +119,233 @@ A relay that does not run a query, or stops running one, answers with `CLOSED`:
 
 | Prefix | Meaning |
 |---|---|
-| `invalid:` | the query breaks this NIP: its syntax, a typing rule, an unknown name or function, or a missing parameter |
+| `invalid:` | the query breaks this NIP: its syntax, a typing rule, an unknown name or function, or the wrong number of parameters |
 | `auth-required:`, `restricted:` | the same access rules as `REQ` |
 | `unsupported:` | the relay declines this valid query because of its cost; see [Cost](#cost) |
-| `error:` | evaluation failed, e.g. an INTEGER `sum` overflow, or the relay failed internally |
-| `closed:` | the relay discarded the query, e.g. after an idle timeout |
+| `error:` | evaluation failed (see [Errors](#errors)), or the relay failed internally |
+
+## NQL for SQL users
+
+NQL is the part of SQL's `SELECT` that every engine agrees on, plus these rules:
+
+- **Types are strict.** INTEGER (64-bit), REAL (binary64), TEXT and BOOLEAN. INTEGER mixes with REAL in arithmetic and comparisons; every other mix needs `CAST`. `'1' + 1`, `'a' || 1` and `WHERE kind` are invalid.
+- **Arithmetic never silently degrades.** Overflow, division by zero and math outside a function's domain fail the query. INTEGER division truncates: `7 / 2` is 3.
+- **`CAST` from TEXT never fails:** text that is not exactly a number is NULL, so `CAST(t1 AS INTEGER)` skips malformed tag values.
+- **Text is compared by code point**, and `LIKE` is case-sensitive with no escape character.
+- **NULLs sort last** in ascending order and first in descending order.
+- **Every computed result column needs an `AS` name**, and names are reported in lower case.
+- **Only `JOIN … ON` and `LEFT JOIN … ON`** combine sources. There is no `UNION`, `WITH`, window function or `CASE x WHEN`, and parameters are only `?`.
+- **About 25 functions** exist; see [Functions](#functions).
+
+## Language reference
+
+### Types and values
+
+- **INTEGER**: a signed 64-bit integer.
+- **REAL**: a finite IEEE 754 binary64 number. NQL never produces ±Infinity or NaN.
+- **TEXT**: a sequence of Unicode code points. Lengths, positions and ordering count code points.
+- **BOOLEAN**: `TRUE` or `FALSE`.
+
+`NULL` is the absence of a value and belongs to every type. INTEGER and REAL are the *numeric* types.
+
+Every expression has one static type, fixed before execution by the rules below. A query that breaks a typing rule is invalid, and the relay MUST refuse it before evaluating anything.
+
+The only implicit conversion is **numeric promotion**: where an arithmetic or comparison operator has one INTEGER and one REAL operand, the INTEGER operand is converted to REAL. Nothing else converts without `CAST`: the branches of a `CASE`, the arguments of `coalesce` and `nullif` MUST have the same type.
+
+A `NULL` literal, or a parameter whose value is `null`, takes the type of its context: the other operand of an operator, the other elements of an `IN` list, or the other branches or arguments of `CASE`, `coalesce` or `nullif`. Where nothing fixes it, as in `SELECT NULL AS x`, its type is TEXT.
+
+### Syntax
+
+A query is exactly one `query`. Keywords and names are case-insensitive. Whitespace separates tokens. There are no comments and no trailing `;`.
+
+```
+query         = "SELECT" [ "DISTINCT" ] results
+                [ "FROM" source { [ "LEFT" ] "JOIN" source "ON" expr } ]
+                [ "WHERE" expr ]
+                [ "GROUP" "BY" expr { "," expr } [ "HAVING" expr ] ]
+                [ "ORDER" "BY" order-term { "," order-term } ]
+                [ "LIMIT" count [ "OFFSET" count ] ]
+results       = "*" | expr [ "AS" name ] { "," expr [ "AS" name ] }
+source        = ( "events" | "tags" ) [ "AS" name ] | "(" query ")" "AS" name
+order-term    = expr [ "ASC" | "DESC" ]
+count         = integer | "?"
+
+expr          = and-expr { "OR" and-expr }
+and-expr      = not-expr { "AND" not-expr }
+not-expr      = "NOT" not-expr | predicate
+predicate     = sum [ ( "=" | "<>" | "<" | "<=" | ">" | ">=" ) sum
+                    | "IS" [ "NOT" ] "NULL"
+                    | [ "NOT" ] "IN" "(" ( query | expr { "," expr } ) ")"
+                    | [ "NOT" ] "LIKE" sum
+                    | [ "NOT" ] "BETWEEN" sum "AND" sum ]
+sum           = product { ( "+" | "-" | "||" ) product }
+product       = unary { ( "*" | "/" | "%" ) unary }
+unary         = "-" unary | primary
+primary       = literal | "?" | [ name "." ] name | call | cast | case
+              | "(" expr ")" | "(" query ")" | "EXISTS" "(" query ")"
+call          = name "(" [ "*" | [ "DISTINCT" ] expr { "," expr } ] ")"
+cast          = "CAST" "(" expr "AS" ( "INTEGER" | "REAL" | "TEXT" ) ")"
+case          = "CASE" "WHEN" expr "THEN" expr { "WHEN" expr "THEN" expr } [ "ELSE" expr ] "END"
+literal       = integer | real | string | "NULL" | "TRUE" | "FALSE"
+```
+
+Binary operators are left-associative. A `predicate` holds at most one comparison, so `a < b = c` is invalid; write `(a < b) = c`.
+
+Lexical rules:
+
+- **Names** match `[A-Za-z_][A-Za-z0-9_]*` and MUST NOT be one of the keywords `AND AS ASC BETWEEN BY CASE CAST DESC DISTINCT ELSE END EXISTS FALSE FROM GROUP HAVING IN INTEGER IS JOIN LEFT LIKE LIMIT NOT NULL OFFSET ON OR ORDER REAL SELECT TEXT THEN TRUE WHEN WHERE`.
+- **Integers** are decimal digits and MUST fit in a signed 64-bit integer. The one exception is `9223372036854775808`, which is valid only directly after a unary `-`.
+- **Reals** are `digits "." digits [exponent]` or `digits exponent`, where `exponent = ("e" | "E") ["+" | "-"] digits`. The value is rounded to the nearest binary64. A real that rounds to infinity, or to zero although it is not zero, is invalid.
+- **Strings** are enclosed in single quotes, and `''` stands for one quote. There are no other escapes.
+
+### Names
+
+Each source has a name: its alias, or `events`/`tags` when it has none. Names of sources joined in one `FROM` MUST differ.
+
+A qualified column `s.c` refers to column `c` of source `s`. An unqualified column `c` refers to the one source in the innermost enclosing `FROM` that has a column `c`. If none has it, the next enclosing query is searched (a correlated reference). If two sources at the same level have it, or none anywhere does, the query is invalid.
+
+**Result columns.** `*` stands for every column of every source, in `FROM` order and then in the order of the tables above. A result column is named by its alias, or, if it is a bare column, by that column's name. Any other result column without an alias makes the query invalid. Names are reported in lower case, and those of the outermost query and of a subquery in `FROM` MUST be unique. A subquery in `FROM` exposes its result columns under those names.
+
+### Evaluation
+
+A query is evaluated in this order:
+
+1. `FROM` combines its sources left to right. `JOIN … ON` keeps each pair of rows for which `ON` is TRUE. `LEFT JOIN … ON` also keeps each left row that matched nothing, paired with NULLs. Without `FROM`, there is exactly one row.
+2. `WHERE` keeps the rows for which it is TRUE.
+3. The rows are grouped (see [Grouping and aggregates](#grouping-and-aggregates)), and `HAVING` keeps the groups for which it is TRUE.
+4. The result columns are computed, and `DISTINCT` removes duplicate rows.
+5. `ORDER BY` sorts the rows, and `LIMIT`/`OFFSET` keep a slice of them.
+
+`ON`, `WHERE`, `HAVING`, `CASE` conditions and the operands of `NOT`, `AND` and `OR` MUST be BOOLEAN.
+
+Two rows are **duplicates** when each pair of values is equal or both NULL. The same holds for the values `GROUP BY` groups on.
+
+### Operators
+
+*N* is either numeric type.
+
+| Operator | Operands | Result |
+|---|---|---|
+| `+` `-` `*` | N, N | INTEGER if both are INTEGER, else REAL |
+| `/` | N, N | INTEGER if both are INTEGER (truncated toward zero), else REAL |
+| `%` | INTEGER, INTEGER | INTEGER, with the sign of the left operand |
+| unary `-` | N | the same type |
+| `\|\|` | TEXT, TEXT | TEXT, the concatenation |
+| `=` `<>` | two numbers, two TEXT or two BOOLEAN | BOOLEAN |
+| `<` `<=` `>` `>=`, `BETWEEN` | numbers, or all TEXT | BOOLEAN |
+| `IN` | as `=` between `x` and each element | BOOLEAN |
+| `LIKE` | TEXT, TEXT | BOOLEAN |
+| `IS NULL`, `IS NOT NULL` | any | BOOLEAN, never NULL |
+| `NOT`, `AND`, `OR` | BOOLEAN | BOOLEAN |
+
+- Every operator except `IS [NOT] NULL`, `AND` and `OR` yields NULL when an operand is NULL.
+- `AND` and `OR` use three-valued logic: `FALSE AND NULL` is FALSE, `TRUE OR NULL` is TRUE, and every other combination with NULL is NULL.
+- TEXT compares code point by code point, and a string sorts before any longer string that starts with it. Numbers compare by value.
+- `x IN (…)` is TRUE if `x` equals an element, NULL if none does and `x` or an element is NULL, and FALSE otherwise. `IN (query)` takes the elements from the query's single column. `NOT IN` negates `IN`, leaving NULL as NULL.
+- `x BETWEEN a AND b` is `x >= a AND x <= b`.
+- `x LIKE p` is TRUE if `x` matches all of pattern `p`, where `%` matches any sequence of code points, `_` matches exactly one, and every other code point matches only itself. Matching is case-sensitive.
+
+### Errors
+
+These conditions fail the whole query with `error:`:
+
+- an INTEGER `+`, `-`, `*`, `/`, unary `-`, `abs` or `sum` whose exact result does not fit in 64 bits;
+- `/` or `%` by zero, INTEGER or REAL;
+- a REAL result that is too large for binary64 (overflow), or that is not zero but rounds to zero (underflow);
+- a numeric function applied outside its domain (see [Numeric](#numeric));
+- a scalar subquery that yields more than one row.
+
+An expression is evaluated only for rows that reach it: result columns, `HAVING` and `ORDER BY` only for rows and groups that `WHERE` and `HAVING` kept, and a `CASE` result only when its condition selects it. The order in which the operands of other operators are evaluated is unspecified, so guard a computation that may fail with `CASE`, not with `AND`.
+
+### `CAST`
+
+| From \ To | INTEGER | REAL | TEXT |
+|---|---|---|---|
+| INTEGER | itself | the nearest REAL | decimal digits, with a leading `-` if negative |
+| REAL | truncated toward zero; NULL if that does not fit | itself | *invalid* |
+| TEXT | see below | see below | itself |
+| BOOLEAN | `TRUE` → 1, `FALSE` → 0 | *invalid* | *invalid* |
+
+`CAST` never fails, and NULL casts to NULL.
+
+- **TEXT to INTEGER:** if the whole text is an optional `+` or `-` followed by one or more decimal digits, and its value fits in 64 bits, the result is that value. Otherwise it is NULL: `'12abc'`, `' 42'`, `'3.9'`, `'1e3'` and `''` all give NULL.
+- **TEXT to REAL:** if the whole text is an optional `+` or `-` followed by an `integer` or `real` literal, and that literal would be valid, the result is its value. Otherwise it is NULL, which also covers `'.5'`, `'Infinity'` and `'1e999'`.
+
+### `CASE`
+
+`CASE WHEN c1 THEN r1 … [ELSE e] END` yields the first `r` whose `c` is TRUE. If there is none, it yields `e`, or NULL when there is no `ELSE`. All `r` and `e` MUST have the same type, which is the type of the `CASE`.
+
+### Subqueries
+
+- A subquery used as a value MUST have one column; its type is that column's type. It yields that column's value in its only row, or NULL when it has no row. More than one row is an [error](#errors).
+- `EXISTS (query)` is TRUE if the query yields at least one row, and FALSE otherwise.
+- A subquery may refer to the columns of the queries that enclose it.
+
+### Grouping and aggregates
+
+A query is **grouped** if it has `GROUP BY`, or if an aggregate appears in its result columns, `HAVING` or `ORDER BY`.
+
+- With `GROUP BY`, rows are grouped by the values of its terms. Without it, all rows form one group, which exists even when there are no rows.
+- A `GROUP BY` term is an expression over the sources, or the bare name of a result column's alias.
+- Outside aggregate arguments, the result columns, `HAVING` and `ORDER BY` of a grouped query may use a source column only as part of an expression that is written the same as a `GROUP BY` term (ignoring case and whitespace), or as a column that is a `GROUP BY` term itself.
+- Aggregates appear only in result columns, `HAVING` and `ORDER BY`, and never inside another aggregate. `HAVING` requires `GROUP BY`.
+
+| Aggregate | Argument | Result | Value over the group's non-NULL arguments |
+|---|---|---|---|
+| `count(*)` | none | INTEGER | the number of rows in the group |
+| `count(x)` | any | INTEGER | how many there are |
+| `count(DISTINCT x)` | any | INTEGER | how many distinct values there are |
+| `sum(x)` | N | the type of `x` | their sum, or NULL if there are none |
+| `avg(x)` | N | REAL | their mean, or NULL if there are none |
+| `min(x)`, `max(x)` | N or TEXT | the type of `x` | the least or greatest, or NULL if there are none |
+
+An INTEGER `sum` is exact, and only its final value must fit in 64 bits. A REAL `sum` or `avg` may add values in any order, so relays may differ in its last bits.
+
+### `ORDER BY`, `LIMIT`, `OFFSET`
+
+- An `order-term` is the bare name of a result column, or an expression over the sources. After `DISTINCT`, only result columns may be used.
+- A bare name that is both a result column's alias and a source column is invalid in `ORDER BY` and `GROUP BY`, unless the alias names that same column.
+- Terms MUST be numeric or TEXT. `ASC` is the default. NULLs sort after every value, so they come last in ascending order and first in descending order.
+- The order of rows that compare equal on every term is unspecified, as is the order of rows without `ORDER BY`.
+- `LIMIT` and `OFFSET` take a non-negative INTEGER: a literal, or a `?` whose value is one.
+
+### Functions
+
+These are all the functions. Every function yields NULL when an argument is NULL, except `coalesce` and `nullif`. An argument of the wrong type makes the query invalid.
+
+#### Text
+
+| Function | Result | Value |
+|---|---|---|
+| `length(TEXT)` | INTEGER | the number of code points |
+| `lower(TEXT)`, `upper(TEXT)` | TEXT | ASCII letters converted; every other code point unchanged |
+| `trim(x TEXT [, chars TEXT])`, `ltrim(…)`, `rtrim(…)` | TEXT | `x` without the code points in `chars` (a space when omitted) at both ends, the start or the end |
+| `replace(x TEXT, from TEXT, to TEXT)` | TEXT | `x` with each non-overlapping `from`, scanned left to right, replaced by `to`; `x` itself when `from` is empty |
+| `instr(x TEXT, y TEXT)` | INTEGER | the 1-based position of the first `y` in `x`; 0 if there is none, and 1 if `y` is empty |
+| `substr(x TEXT, start INTEGER [, len INTEGER])` | TEXT | the code points of `x` at positions `start` through `start + len - 1`, counting from 1, that exist; without `len`, through the end. NULL if `len` is negative |
+
+So `substr('abcdef', 2, 3)` is `'bcd'`, `substr('abcdef', 0, 2)` is `'a'`, and `substr('abcdef', 10)` is `''`.
+
+#### Conditional
+
+| Function | Result | Value |
+|---|---|---|
+| `coalesce(x, y, …)` (2 or more arguments) | their type | the first non-NULL argument, or NULL |
+| `nullif(x, y)` | their type | NULL if `x = y` is TRUE, otherwise `x` |
+
+#### Numeric
+
+| Function | Result | Value | Error when |
+|---|---|---|---|
+| `abs(N)` | same type | the absolute value | the INTEGER result does not fit |
+| `round(N)` | REAL | the nearest integer, ties to even: `round(2.5)` = 2.0 | |
+| `ceil(N)`, `floor(N)`, `trunc(N)` | REAL | toward +∞, toward −∞, toward zero | |
+| `sqrt(N)` | REAL | the square root | the argument is negative |
+| `exp(N)` | REAL | *e*^x | overflow or underflow |
+| `ln(N)`, `log10(N)` | REAL | the natural and base-10 logarithm | the argument is zero or negative |
+| `pow(x N, y N)` | REAL | x^y | `x` is zero and `y` negative, `x` is negative and `y` not an integer, or overflow or underflow |
+
+`sqrt` is correctly rounded. The others MUST be within a relative error of 10⁻¹² and exact where the exact result is representable, as in `pow(2, 10)`, `exp(0)`, `ln(1)` and `log10(1000)`.
 
 ## Cost
 
@@ -438,13 +356,13 @@ A relay MAY decline any valid query it judges too expensive with `unsupported:`,
 
 Relays SHOULD state the condition that would make the query acceptable. A declined query is not a wrong answer. A relay that answers MUST answer exactly as this NIP specifies.
 
-Clients get the best service from queries that constrain every `events`/`tags` source by `kind`, `pubkey`, `id` or a tag's `t0`/`t1`, and that use `ORDER BY created_at DESC` with a `LIMIT` for listings.
+Clients get the best service from queries that constrain every source by `kind`, `pubkey`, `id` or a tag's `t0`/`t1`, and from listings that use `ORDER BY created_at DESC` with a `LIMIT`.
 
 ## Conformance
 
 [`FF-conformance.json`](FF-conformance.json) holds this NIP's test vectors:
 - `events`: a corpus of signed events;
-- `cases`: queries run against that corpus.
+- `cases`: queries to run against that corpus.
 
 To check a relay:
 1. Start it empty, with every access restriction off.
@@ -457,75 +375,71 @@ Each case either expects an answer or a refusal:
   - With `tolerance`, a REAL value may differ from the expected one by up to `tolerance` × max(1, |expected|).
 - **A refusal:** the relay MUST send `CLOSED` whose reason starts with the case's `error` value followed by `:`.
 
-A case with `sqlite_differs` states where SQLite on its own gives a different answer; see the implementation notes.
-
 A relay conforms when every case passes, apart from queries it declines with `unsupported:` for cost.
 
 ## Advertising
 
-Relays that implement this NIP include its number in `supported_nips` ([NIP-11](11.md)).
-
-## Examples
-
-Zap totals per zapped note, in sats:
-
-```sql
-SELECT target.t1 AS note, count(*) AS zaps, sum(CAST(amount.t1 AS INTEGER)) / 1000 AS sats
-FROM tags AS target JOIN tags AS amount ON amount.event_id = target.event_id AND amount.t0 = 'amount'
-WHERE target.kind = 9735 AND target.t0 = 'e'
-GROUP BY target.t1 ORDER BY sats DESC LIMIT 20
-```
-
-Write relays named in [NIP-65](65.md) lists, by how many authors use them:
-
-```sql
-SELECT t1 AS relay, count(DISTINCT pubkey) AS authors
-FROM tags
-WHERE kind = 10002 AND t0 = 'r' AND (t2 IS NULL OR t2 = 'write')
-GROUP BY t1 ORDER BY authors DESC LIMIT 100
-```
-
-Reactions per note of one author, including notes with none:
-
-```sql
-SELECT notes.id, count(reactions.event_id) AS total
-FROM events AS notes LEFT JOIN tags AS reactions
-  ON reactions.t1 = notes.id AND reactions.kind = 7 AND reactions.t0 = 'e'
-WHERE notes.kind = 1 AND notes.pubkey = ?
-GROUP BY notes.id ORDER BY total DESC
-```
-
-The `created_at` of each author's newest kind `0`:
-
-```sql
-SELECT pubkey, max(created_at) FROM events WHERE kind = 0 AND pubkey IN (?, ?, ?) GROUP BY pubkey
-```
-
-The geometric mean of zap amounts in a time window:
-
-```sql
-SELECT exp(avg(ln(CAST(t1 AS REAL)))) FROM tags
-WHERE kind = 9735 AND t0 = 'amount' AND created_at BETWEEN :since AND :until
-```
+Relays that implement this NIP include its number in `supported_nips` ([NIP-11](11.md)). A relay that caps result rows SHOULD publish the cap as `max_nql_rows` in its NIP-11 `limitation` object.
 
 ## Implementation notes
 
 This section is non-normative.
 
-**SQLite.** NQL is designed so that any conforming query runs unchanged on SQLite 3.35 or later, built with math functions and executed over views of an event store shaped like `events` and `tags`. SQLite and NQL agree on every rule above except these, which an implementation built on SQLite MUST account for:
+In every design, parse and type-check the query yourself, and never hand the client's text to a database. The type check also gives each result column its type.
 
-| Rule | SQLite's behavior | What the implementation does |
-|---|---|---|
-| Static types and BOOLEAN | SQLite is dynamically typed and has no BOOLEAN | Type-check before executing, and map 0/1 to `false`/`true` in BOOLEAN result columns |
-| INTEGER overflow in `+ - *` | SQLite switches to REAL | Emit `iif(typeof(r) = 'integer', r, NULL)` around the operation |
-| `abs` of the smallest INTEGER | SQLite fails the statement | Emit `CASE WHEN x = -9223372036854775808 THEN NULL ELSE abs(x) END` |
-| Mixed-type comparisons | SQLite allows them | Rejected by the type check |
-| Numeric promotion in `CASE`, `coalesce`, `ifnull` and `UNION` | SQLite keeps an INTEGER value INTEGER even where the result is REAL, so `(CASE WHEN c THEN 1 ELSE 2.5 END) / 2` divides as integers | Wrap the INTEGER branches in `CAST(… AS REAL)` |
-| Infinity in results | SQLite prints REAL infinity as `Inf` | Map it to the spelling defined under [Protocol](#protocol) |
+### PostgreSQL
 
-**Stores that are not SQLite.** Such a store can still answer the language:
-1. Push each source's constant conditions (`kind`, `pubkey`, `id`, tag `t0`/`t1`, time bounds) down as a NIP-01 filter.
-2. Load the matching events into an in-memory SQLite shaped like `events` and `tags`.
-3. Run the query there.
+Expose the relay's events as `events` and `tags` relations with `int8` and `text` columns under the `C` collation (for example, create the database with `LOCALE 'C'`). Then translate the checked query into SQL:
 
-An engine that computes the same results natively is equally conforming.
+- Emit every expression fully parenthesized, INTEGER literals as `n::int8`, REAL literals as `x::float8`, and the types INTEGER and REAL as `int8` and `float8`.
+- Bind the parameters with their types.
+- Quote each alias as its lower-case name.
+- Run the query in a read-only transaction with a `statement_timeout`.
+
+PostgreSQL then applies these rules on its own: NULL ordering, `round`, errors for overflow, underflow, division by zero, domain and too many subquery rows, INTEGER division, and grouping. What remains is a handful of rewrites:
+
+| NQL | PostgreSQL |
+|---|---|
+| `CAST(x AS INTEGER)`, `x` TEXT | `CASE WHEN x ~ '^[+-]?[0-9]+$' AND pg_input_is_valid(x, 'int8') THEN x::int8 END` |
+| `CAST(x AS REAL)`, `x` TEXT | `CASE WHEN x ~ '^[+-]?[0-9]+(\.[0-9]+)?([eE][+-]?[0-9]+)?$' AND pg_input_is_valid(x, 'float8') THEN x::float8 END` |
+| `CAST(x AS INTEGER)`, `x` REAL | `CASE WHEN x >= -9223372036854775808::float8 AND x < 9223372036854775808::float8 THEN trunc(x)::int8 END` |
+| `CAST(x AS INTEGER)`, `x` BOOLEAN | `x::int4::int8` |
+| `x LIKE p` | `x LIKE p ESCAPE ''` |
+| `instr(x, y)` | `strpos(x, y)` |
+| `substr(x, s, n)` | `CASE WHEN n >= 0 THEN substr(x, s, n) END`, with `s` and `n` clamped into the `int4` range |
+| `sum(x)`, `x` INTEGER | `sum(x)::int8` |
+| `avg(x)` | `avg(x)::float8` |
+| an untyped `NULL` | `NULL::text` |
+
+### Key-value stores (LMDB and similar)
+
+A relay whose events sit in LMDB, RocksDB or a similar store keeps the indexes it already has for `REQ` and evaluates the query itself:
+
+1. Read each `events` or `tags` source through the index that its constant conditions (`id`/`event_id`, `pubkey`, `kind`, `t0` with `t1`, and `created_at` bounds) select, exactly as it would read a NIP-01 filter. Decline with `unsupported:` when no index applies.
+2. Evaluate everything else in a small interpreter over typed values:
+   - joins by index lookups on the join key (an event by `id`, tag rows by `t0`/`t1` or `event_id`);
+   - grouping in a hash map;
+   - ordering by a sort, or a bounded heap when there is a `LIMIT`.
+
+The rules that most often go wrong when written by hand:
+- **Code-point order.** It is not UTF-16 order: in Java, Kotlin or JavaScript, compare code points rather than `String.compareTo`, or compare UTF-8 bytes.
+- **64-bit INTEGER arithmetic** must detect overflow (`Math.addExact` and similar), and an INTEGER `sum` must accumulate exactly (in 128 bits or a big integer).
+- **REAL results** must be checked for overflow and underflow.
+- **`round`** rounds ties to even (`Math.rint`).
+- **`CAST` from TEXT** matches the whole text, not a prefix.
+- **`LIKE` and `substr`** count code points.
+
+The conformance vectors cover each of these.
+
+### SQLite
+
+The same approach works with SQLite's `events`/`tags` views, but SQLite differs from NQL on more rules than PostgreSQL does:
+- `LIKE` is case-insensitive unless `PRAGMA case_sensitive_like` is on.
+- NULLs sort first in ascending order; emit `NULLS LAST` and `NULLS FIRST`.
+- Overflow becomes REAL, and division by zero and domain errors become NULL.
+- `CAST` reads a numeric prefix.
+- `round` rounds ties away from zero, and `ceil`, `floor` and `trunc` keep INTEGER arguments INTEGER.
+- A scalar subquery takes its first row.
+- Result names keep their case.
+
+An implementation on SQLite registers its own functions for arithmetic, `CAST` and the math functions, emitted in place of SQLite's.
