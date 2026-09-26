@@ -304,7 +304,7 @@ An INTEGER `sum` is exact, and only its final value must fit in 64 bits. A REAL 
 ### `ORDER BY`, `LIMIT`, `OFFSET`
 
 - An `order-term` is the bare name of a result column, or an expression over the sources. It MUST NOT be an integer literal, which SQL would read as a column position. After `DISTINCT`, only result columns may be used.
-- A bare name that is both a result column's alias and a source column is invalid in `ORDER BY` and `GROUP BY`, unless the alias names that same column.
+- A bare name that is both a result column's name and a source column is invalid in `ORDER BY` and `GROUP BY`, unless that result column is one of the source columns with the name (as in `SELECT d.t1 … ORDER BY t1`).
 - Terms MUST be numeric or TEXT. `ASC` is the default. NULLs sort after every value, so they come last in ascending order and first in descending order.
 - The order of rows that compare equal on every term is unspecified, as is the order of rows without `ORDER BY`.
 - `LIMIT` and `OFFSET` take a non-negative INTEGER: a literal, or a `?` whose value is one.
