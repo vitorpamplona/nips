@@ -4086,6 +4086,16 @@
       "error": "invalid"
     },
     {
+      "name": "invalid/group-by-position-alone",
+      "query": "SELECT count(*) AS n FROM events GROUP BY 1",
+      "error": "invalid"
+    },
+    {
+      "name": "invalid/order-by-position-of-aggregate",
+      "query": "SELECT kind, count(*) AS n FROM events GROUP BY kind ORDER BY 2",
+      "error": "invalid"
+    },
+    {
       "name": "invalid/order-by-ordinal",
       "query": "SELECT kind FROM events ORDER BY 1",
       "error": "invalid"

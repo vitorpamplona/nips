@@ -286,7 +286,7 @@ An expression is evaluated only for rows that reach it: result columns, `HAVING`
 A query is **grouped** if it has `GROUP BY`, or if an aggregate appears in its result columns, `HAVING` or `ORDER BY`.
 
 - With `GROUP BY`, rows are grouped by the values of its terms. Without it, all rows form one group, which exists even when there are no rows.
-- A `GROUP BY` term is an expression over the sources, or the bare name of a result column's alias.
+- A `GROUP BY` term is an expression over the sources, or the bare name of a result column's alias. It MUST NOT be an integer literal, which SQL would read as a column position.
 - Outside aggregate arguments, the result columns, `HAVING` and `ORDER BY` of a grouped query may use a source column only as part of an expression that is written the same as a `GROUP BY` term (ignoring case and whitespace), or as a column that is a `GROUP BY` term itself.
 - Aggregates appear only in result columns, `HAVING` and `ORDER BY`, and never inside another aggregate. `HAVING` requires `GROUP BY`.
 
@@ -303,7 +303,7 @@ An INTEGER `sum` is exact, and only its final value must fit in 64 bits. A REAL 
 
 ### `ORDER BY`, `LIMIT`, `OFFSET`
 
-- An `order-term` is the bare name of a result column, or an expression over the sources. After `DISTINCT`, only result columns may be used.
+- An `order-term` is the bare name of a result column, or an expression over the sources. It MUST NOT be an integer literal, which SQL would read as a column position. After `DISTINCT`, only result columns may be used.
 - A bare name that is both a result column's alias and a source column is invalid in `ORDER BY` and `GROUP BY`, unless the alias names that same column.
 - Terms MUST be numeric or TEXT. `ASC` is the default. NULLs sort after every value, so they come last in ascending order and first in descending order.
 - The order of rows that compare equal on every term is unspecified, as is the order of rows without `ORDER BY`.
