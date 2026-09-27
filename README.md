@@ -116,6 +116,7 @@ NIPs listed here are not a protocol checklist. Nothing forces any software to im
 - [NIP-CC: Geocaching](CC.md)
 - ~~[NIP-EE: E2EE Messaging using MLS Protocol](EE.md) --- **unrecommended**: superseded by the [Marmot Protocol](https://github.com/marmot-protocol/marmot)~~
 - [NIP-F4: Podcasts](F4.md)
+- [NIP-FE: Relay Commands over HTTP](FE.md)
 
 ## Event Kinds
 
